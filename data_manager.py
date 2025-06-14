@@ -1,0 +1,339 @@
+import pandas as pd
+import json
+import os
+from datetime import datetime, timezone, timedelta # Ensure timedelta is imported if used
+import traceback # For detailed error logging
+
+class DataManager:
+    def __init__(self, 
+                 settings_file='app_settings.json', 
+                 signals_file='signals_log.csv', 
+                 deals_file='deals_log.csv', 
+                 trade_requests_file='trade_requests_log.csv', 
+                 log_callback=None):
+        
+        self.settings_file = settings_file
+        self.signals_file = signals_file
+        self.deals_file = deals_file
+        self.trade_requests_file = trade_requests_file # For logging trade execution attempts
+        
+        self.log_callback = log_callback if log_callback else self._default_log_callback
+        
+        self.default_settings = {
+            # MT5 Connection
+            "mt5_login": "", 
+            "mt5_password": "", 
+            "mt5_server": "", 
+            "mt5_path": "C:/Program Files/MetaTrader 5/terminal64.exe", # Common default, adjust if needed
+            "mt5_magic_number": 234000, 
+            "mt5_retries": 3, 
+            "mt5_retry_delay": 2.0, # seconds
+            "mt5_timeout_ms": 20000, # milliseconds for mt5.initialize()
+
+            # Manual Signal Filtering (UI)
+            "manual_filter_min_confidence": 70,
+
+            # Auto Trading
+            "auto_trade_enabled": False,
+            "auto_trade_min_confidence": 75,
+            "risk_percent_per_trade": 1.0,
+            "default_sl_pips": 50,  # General default SL in points/pips
+            "default_tp_pips": 100, # General default TP in points/pips
+            "min_trade_interval_minutes_default": 15, # Global default min interval between trades for a symbol
+
+            # Symbol Specific Settings (examples, can be extended)
+            "gold_symbol": "XAUUSD", 
+            "gold_sl_pips": 300, 
+            "gold_tp_pips": 600,
+            "max_allowed_spread_points_gold": 30,
+            "min_trade_interval_minutes_xauusd": 10, # Specific for gold
+
+            "bitcoin_symbol": "BTCUSD", 
+            "btc_sl_pips": 10000, 
+            "btc_tp_pips": 20000,
+            "max_allowed_spread_points_bitcoin": 1000,
+            "min_trade_interval_minutes_btcusd": 30, # Specific for bitcoin
+            
+            "max_allowed_spread_points_other": 50, # For symbols not specifically defined
+
+            # Timers
+            "signals_refresh_interval_minutes": 15,
+            "position_monitor_interval_seconds": 15,
+            "news_check_interval_minutes": 30, # For NewsManager
+
+            # Performance & Logging
+            "log_closed_deals_enabled": True, # Whether to fetch/log deals from MT5 for performance
+            "default_initial_balance_for_analysis": 10000.0,
+            "sharpe_periods_per_year": 252, # For annualizing Sharpe ratio (e.g., daily returns)
+            "log_trade_requests_enabled": True, # Log details of each trade request sent
+
+            # News Filter (for NewsManager)
+            "news_check_enabled": True,
+            "news_impact_filter": ["High"], # e.g., ["High", "Medium"] or ["USD:High", "EUR:High"]
+            "halt_trades_on_news": True,
+            "news_halt_minutes_before": 15,
+            "news_halt_minutes_after": 15,
+            "news_api_url_forex_factory": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml?version=xxxxxx.1", # Example, replace with actual if used
+
+            # Time Filter for Trading
+            "time_filter_enabled": False, 
+            "trade_start_time": "00:00", # UTC
+            "trade_end_time": "23:59",   # UTC
+
+            # Auto Close Settings
+            "auto_close_by_points_enabled": False,
+            "auto_close_target_points": 1000, # Aggregate profit in points for all open magic positions
+
+            # Model Filenames (can be overridden by user or auto-generated)
+            "current_model_filename": "model_XAUUSD.joblib", # Default for Gold
+            "current_btc_model_filename": "model_BTCUSD.joblib", # Default for Bitcoin
+        }
+        self.settings = {} # Will be populated by load_settings
+        self.load_settings()
+
+
+    def _default_log_callback(self, message, level="INFO"):
+        """Fallback logger if no callback is provided."""
+        print(f"DataManager (default_logger): [{level.upper()}] {message}")
+
+    def _log(self, message, level="INFO"):
+        """Wrapper to use the provided log_callback."""
+        # Ensure message is a string
+        if not isinstance(message, str):
+            try:
+                message = str(message)
+            except Exception:
+                message = "DataManager: Error converting log message to string."
+                level = "ERROR"
+        
+        self.log_callback(f"DataManager: {message}", level)
+
+    def load_settings(self):
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    loaded_settings = json.load(f)
+                    # Merge with defaults to ensure all keys from default_settings are present
+                    # and new settings from file override defaults.
+                    self.settings = {**self.default_settings, **loaded_settings}
+                self._log(f"Application settings loaded successfully from '{self.settings_file}'.", "INFO")
+            else:
+                self.settings = self.default_settings.copy()
+                self._log(f"Settings file '{self.settings_file}' not found. Loaded default settings. Will create on save.", "INFO")
+                self.save_settings() # Create the file with defaults if it doesn't exist
+        except json.JSONDecodeError as e_json:
+            self.settings = self.default_settings.copy() # Fallback to defaults on JSON error
+            self._log(f"Error decoding JSON from settings file '{self.settings_file}': {e_json}. Loaded default settings.", "ERROR")
+        except Exception as e:
+            self.settings = self.default_settings.copy() # Fallback to defaults on other errors
+            self._log(f"Error loading settings from '{self.settings_file}': {e}. Loaded default settings.", "ERROR")
+            self._log(traceback.format_exc(), "DEBUG") # Log full traceback for debugging
+
+    def save_settings(self):
+        try:
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=4, ensure_ascii=False)
+            self._log(f"Application settings saved to '{self.settings_file}'.", "INFO")
+        except Exception as e:
+            self._log(f"Error saving settings to '{self.settings_file}': {e}", "ERROR")
+            self._log(traceback.format_exc(), "DEBUG")
+
+    def get_setting(self, key, default_override=None):
+        """
+        Retrieves a setting value.
+        If default_override is provided, it's used if key is not in self.settings.
+        Otherwise, it falls back to self.default_settings if key is not in self.settings.
+        """
+        if default_override is not None:
+            return self.settings.get(key, default_override)
+        return self.settings.get(key, self.default_settings.get(key)) # Fallback to default_settings value
+
+    def update_setting(self, key, value):
+        self.settings[key] = value
+        self._log(f"Setting '{key}' updated to '{value}'", "DEBUG")
+        self.save_settings() # Persist change immediately
+
+    def signal_to_text(self, signal_val):
+        """Converts numerical or string signal to display text."""
+        if isinstance(signal_val, str):
+            s_lower = signal_val.lower()
+            if s_lower == 'buy' or s_lower == '1': return "شراء"
+            if s_lower == 'sell' or s_lower == '-1' or s_lower == '0': return "بيع"
+        elif isinstance(signal_val, (int, float)):
+            if signal_val == 1: return "شراء"
+            if signal_val == -1 or signal_val == 0: return "بيع"
+        return str(signal_val) # Fallback
+
+    def load_signals(self):
+        self._log(f"Attempting to load signals from '{self.signals_file}'...", "DEBUG")
+        if not os.path.exists(self.signals_file):
+            self._log(f"Signals file '{self.signals_file}' not found. Returning empty DataFrame.", "INFO")
+            return pd.DataFrame() # Return empty DataFrame if file doesn't exist
+        try:
+            df = pd.read_csv(self.signals_file)
+            if 'time' in df.columns:
+                df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                # Optionally, localize to UTC if naive, assuming signals are stored/generated in UTC
+                if df['time'].dt.tz is None:
+                    df['time'] = df['time'].dt.tz_localize('UTC', ambiguous='NaT', nonexistent='NaT')
+                else: # If already timezone-aware, convert to UTC
+                    df['time'] = df['time'].dt.tz_convert('UTC')
+            
+            # Ensure other expected columns exist, fill with defaults if not
+            expected_cols = ["Symbol", "signal", "confidence_%", "close", "spread_pips", 
+                             "take_profit_price", "stop_loss_price", "take_profit_pips", 
+                             "stop_loss_pips", "executed", "notes"]
+            for col in expected_cols:
+                if col not in df.columns:
+                    if col == "executed": df[col] = False
+                    elif col == "notes": df[col] = ""
+                    elif col == "spread_pips": df[col] = 0
+                    else: df[col] = np.nan # For numeric columns like confidence, prices
+            
+            self._log(f"Signals loaded from '{self.signals_file}'. Shape: {df.shape}", "INFO")
+            return df
+        except Exception as e:
+            self._log(f"Error loading signals from '{self.signals_file}': {e}", "ERROR")
+            self._log(traceback.format_exc(), "DEBUG")
+            return pd.DataFrame()
+
+    def save_signals(self, df_signals: pd.DataFrame):
+        try:
+            df_to_save = df_signals.copy()
+            # Ensure 'time' is string in a consistent format for CSV if it's datetime
+            if 'time' in df_to_save.columns and pd.api.types.is_datetime64_any_dtype(df_to_save['time']):
+                # Save as UTC string. NaT will become empty string.
+                df_to_save['time'] = df_to_save['time'].dt.strftime('%Y-%m-%d %H:%M:%S.%f%z').fillna('')
+
+            df_to_save.to_csv(self.signals_file, index=False, encoding='utf-8-sig')
+            self._log(f"Signals saved to '{self.signals_file}'. Shape: {df_to_save.shape}", "INFO")
+        except Exception as e:
+            self._log(f"Error saving signals to '{self.signals_file}': {e}", "ERROR")
+            self._log(traceback.format_exc(), "DEBUG")
+
+    def load_deals_history(self, magic_filter=None):
+        self._log(f"Loading deals history (magic_filter: {magic_filter if magic_filter is not None else 'Any'}). From file: '{self.deals_file}'", "DEBUG")
+        if not os.path.exists(self.deals_file):
+            self._log(f"Deals history file '{self.deals_file}' not found. Returning empty DataFrame.", "INFO")
+            return pd.DataFrame()
+        try:
+            df = pd.read_csv(self.deals_file)
+            self._log(f"Read '{self.deals_file}'. Initial shape: {df.shape}. Columns: {df.columns.tolist()}", "DEBUG")
+            if df.empty:
+                self._log("Deals history file is empty after reading.", "INFO")
+                return pd.DataFrame()
+
+            # --- Improved 'open_time' and 'close_time' handling ---
+            for col_name in ['open_time', 'close_time']:
+                if col_name in df.columns:
+                    self._log(f"Processing column '{col_name}'. First 5 raw values: {df[col_name].head().tolist()}", "DEBUG")
+                    
+                    # Store original for debugging if conversion fails extensively
+                    # df[f'{col_name}_original_str'] = df[col_name].astype(str)
+
+                    # Attempt direct conversion first
+                    converted_col = pd.to_datetime(df[col_name], errors='coerce')
+                    initial_nat_count = converted_col.isnull().sum()
+                    self._log(f"'{col_name}': After direct pd.to_datetime, NaT count: {initial_nat_count}/{len(df)}", "DEBUG")
+
+                    # If many NaTs and original looks like numeric timestamps, try unit conversion
+                    if initial_nat_count > len(df) * 0.5: # Heuristic: if more than 50% are NaT
+                        # Check if the original column (before direct to_datetime attempt) has numeric-like data
+                        # This requires checking df[col_name] *before* it's overwritten by converted_col if it's the same name.
+                        # Let's assume df[col_name] still holds original data if direct pd.to_datetime failed for many.
+                        # A safer way is to work on a copy or check original dtype.
+                        
+                        # Try to infer if original data was numeric (potential Unix timestamp)
+                        # This is tricky if df[col_name] was already partially converted or is mixed type.
+                        # For robustness, let's try to see if a significant portion can be numeric.
+                        try:
+                            numeric_series_check = pd.to_numeric(df[col_name], errors='coerce')
+                            if not numeric_series_check.isnull().all() and numeric_series_check.notnull().sum() > len(df) * 0.1 : # If at least 10% are numeric
+                                self._log(f"'{col_name}': High NaT with direct conversion. Original seems to have numeric data. Trying Unix timestamp conversions.", "DEBUG")
+                                
+                                # Try seconds first (common for MT5 'time' field in some contexts)
+                                converted_s = pd.to_datetime(numeric_series_check, unit='s', origin='unix', errors='coerce')
+                                nat_s = converted_s.isnull().sum()
+                                self._log(f"'{col_name}': After unit='s' conversion, NaT count: {nat_s}/{len(df)}", "DEBUG")
+
+                                # Try milliseconds (common for MT5 'time_msc' field)
+                                converted_ms = pd.to_datetime(numeric_series_check, unit='ms', origin='unix', errors='coerce')
+                                nat_ms = converted_ms.isnull().sum()
+                                self._log(f"'{col_name}': After unit='ms' conversion, NaT count: {nat_ms}/{len(df)}", "DEBUG")
+
+                                # Choose the better conversion (fewer NaTs)
+                                if nat_ms < initial_nat_count and nat_ms <= nat_s:
+                                    converted_col = converted_ms
+                                    self._log(f"'{col_name}': Using unit='ms' conversion.", "DEBUG")
+                                elif nat_s < initial_nat_count:
+                                    converted_col = converted_s
+                                    self._log(f"'{col_name}': Using unit='s' conversion.", "DEBUG")
+                        except Exception as e_numeric_conv:
+                             self._log(f"'{col_name}': Error during numeric/Unix conversion attempt: {e_numeric_conv}", "WARNING")
+                    
+                    df[col_name] = converted_col # Assign the best conversion attempt
+                    final_nat_count = df[col_name].isnull().sum()
+                    if final_nat_count > 0:
+                        level = "WARNING" if final_nat_count > len(df) * 0.1 else "INFO" # More concerned if many are still NaT
+                        self._log(f"Column '{col_name}' has {final_nat_count} NaT values after all conversion attempts.", level)
+                    
+                    # Ensure timezone is UTC
+                    if pd.api.types.is_datetime64_any_dtype(df[col_name]) and not df[col_name].isnull().all():
+                        if df[col_name].dt.tz is None:
+                            df[col_name] = df[col_name].dt.tz_localize('UTC', ambiguous='NaT', nonexistent='NaT')
+                        else:
+                            df[col_name] = df[col_name].dt.tz_convert('UTC')
+                        self._log(f"Column '{col_name}' ensured to be UTC. First 5 non-NaT: {df[col_name].dropna().head().tolist()}", "DEBUG")
+                else:
+                    self._log(f"Column '{col_name}' not found in deals log '{self.deals_file}'. Adding as empty NaT column.", "WARNING")
+                    df[col_name] = pd.NaT # Add as empty datetime column if missing
+            # --- End 'open_time' and 'close_time' handling ---
+
+            if 'symbol' in df.columns:
+                df['symbol'] = df['symbol'].astype(str).str.strip().str.upper()
+                # --- FIX for FutureWarning ---
+                df['symbol'] = df['symbol'].replace(['NAN', 'NONE', '', 'UNDEFINED', 'N/A'], pd.NA)
+                # --- End FIX ---
+                df.dropna(subset=['symbol'], inplace=True) # Remove rows where symbol became NA after cleaning
+                self._log(f"Sanitized 'symbol' column. Example after: {df['symbol'].dropna().head(3).tolist()}", "DEBUG")
+            else:
+                self._log(f"'symbol' column not found in deals log. This may cause issues.", "ERROR")
+                # If symbol is critical, might return empty df or raise error
+                # For now, let it proceed but log error.
+
+            if magic_filter is not None:
+                if 'magic' in df.columns:
+                    df['magic'] = pd.to_numeric(df['magic'], errors='coerce')
+                    df.dropna(subset=['magic'], inplace=True) # Remove rows where magic became NaN
+                    df['magic'] = df['magic'].astype(int) # Convert to int after NaNs are handled
+                    df = df[df['magic'] == magic_filter].copy()
+                    self._log(f"Filtered deals by magic number {magic_filter}. Deals remaining: {len(df)}", "DEBUG")
+                else:
+                    self._log(f"'magic' column not found for filtering by magic number {magic_filter}. Returning all deals.", "WARNING")
+            
+            self._log(f"Deals history loaded and processed from '{self.deals_file}'. Final shape: {df.shape}", "INFO")
+            return df
+        except pd.errors.EmptyDataError:
+            self._log(f"Deals history file '{self.deals_file}' is empty or contains no data.", "INFO")
+            return pd.DataFrame()
+        except Exception as e:
+            self._log(f"CRITICAL Error loading or processing deals history from '{self.deals_file}': {e}", "ERROR")
+            self._log(traceback.format_exc(), "DEBUG")
+            return pd.DataFrame() # Return empty on error to prevent downstream issues
+
+    def save_deals_history(self, df_deals: pd.DataFrame):
+        try:
+            df_to_save = df_deals.copy()
+            # Format datetime columns to string for CSV consistency, handling NaT
+            for col in ['open_time', 'close_time']: # Add any other datetime columns you have
+                if col in df_to_save.columns and pd.api.types.is_datetime64_any_dtype(df_to_save[col]):
+                    # Convert to UTC string representation, NaT becomes empty string
+                    df_to_save[col] = df_to_save[col].dt.strftime('%Y-%m-%d %H:%M:%S%z').fillna('')
+            
+            df_to_save.to_csv(self.deals_file, index=False, encoding='utf-8-sig')
+            self._log(f"Deals history saved to '{self.deals_file}'. Shape: {df_to_save.shape}", "INFO")
+        except Exception as e:
+            self._log(f"Error saving deals history to '{self.deals_file}': {e}", "ERROR")
+            self._log(traceback.format_exc(), "DEBUG")
+
+    # You might have other methods for managing models, historical data cache, etc.
